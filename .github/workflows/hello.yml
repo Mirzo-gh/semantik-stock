@@ -1,0 +1,9 @@
+name: hello
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "hello"
