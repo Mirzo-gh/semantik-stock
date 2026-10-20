@@ -122,7 +122,7 @@ def safe_extract(archive: pathlib.Path, destination: pathlib.Path) -> None:
     with tarfile.open(archive) as bundle:
         for member in bundle.getmembers():
             target = (destination / member.name).resolve()
-            if not str(target).startswith(str(destination.resolve())) or member.issym() or member.islnk():
+            if not target.is_relative_to(destination.resolve()) or member.issym() or member.islnk():
                 raise Stop("archive de données invalide")
         bundle.extractall(destination, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
 
@@ -209,9 +209,11 @@ def main() -> None:
     for number in range(1, today_number):
         if site_get(f"daily/{number}.json", daily_dir / f"{number}.json") != "present":
             raise Stop(f"jour passé n°{number} introuvable en ligne : historique incomplet, arrêt")
-    state = site_get(f"daily/{today_number}.json", daily_dir / f"{today_number}.json")
-    if state == "erreur":
-        raise Stop("jour courant illisible en ligne")
+    if site_get(f"daily/{today_number}.json", daily_dir / f"{today_number}.json") != "present":
+        raise Stop("jour courant introuvable ou illisible en ligne : impossible de vérifier le vocabulaire courant")
+    # Le vocabulaire des données doit être le vocabulaire COURANT (celui du jour en ligne), pas seulement un ancien fichier encore hébergé
+    if json.loads((daily_dir / f"{today_number}.json").read_text()).get("vocab") != vocab_hash:
+        raise Stop("le vocabulaire des données n'est pas le vocabulaire courant : republier les données (scripts/local-deploy.sh --publish-data)")
     manifest_path = work / "manifest.json"
     stock_first, stock_last = today_number, today_number - 1
     if storage.get(STOCK_PREFIX + "manifest.json", manifest_path):
@@ -224,6 +226,13 @@ def main() -> None:
             continue  # le jour courant en ligne fait foi
         if not storage.get(f"{STOCK_PREFIX}{number}.json", destination):
             raise Stop(f"jour n°{number} annoncé par le manifeste mais absent du stock")
+    # Jours à venir déjà EN LIGNE (épinglés par le Deploy : leur mot ne doit pas changer) : repris tels quels s'ils sont lisibles (masqués au public : 404, alors régénérés)
+    for number in (today_number + 1, today_number + 2):
+        destination = daily_dir / f"{number}.json"
+        if destination.exists():
+            continue
+        if site_get(f"daily/{number}.json", destination) == "erreur":
+            raise Stop(f"jour n°{number} illisible en ligne")
     for path in daily_dir.glob("*.json"):
         existing[path.name] = sha(path)
     log(f"Historique chargé : {today_number - 1} jours passés, stock existant jusqu'au n°{stock_last}")
