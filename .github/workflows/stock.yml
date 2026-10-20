@@ -1,0 +1,40 @@
+# Alimente le stock de jours pré-générés (R2 privé). DÉPÔT PUBLIC : le journal de ce workflow est public, voir stock_run.py (aucun mot affiché).
+# Déclencheurs : planning hebdomadaire et lancement manuel UNIQUEMENT (jamais pull_request, pull_request_target, issue_comment, push).
+name: stock
+on:
+  schedule:
+    - cron: '23 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Essai : génère et contrôle, n'écrit rien dans R2"
+        type: boolean
+        default: true
+permissions: {}
+concurrency:
+  group: stock
+  cancel-in-progress: false
+jobs:
+  stock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+      - name: Dépendances
+        run: pip install --quiet --disable-pip-version-check -r requirements.txt
+      - name: Génération et dépôt du stock
+        env:
+          SEMANTIK_MASTER_KEY: ${{ secrets.SEMANTIK_MASTER_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          STOCK_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          STOCK_DAYS_AHEAD: '90'
+        run: python stock_run.py

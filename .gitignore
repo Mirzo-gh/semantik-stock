@@ -1,0 +1,11 @@
+# Aucune donnée dans ce dépôt public : tout ce qui suit est refusé même par erreur
+work/
+*.npz
+*.npy
+*.tsv
+*.tar.gz
+*.json
+daily/
+data-work/
+models/
+published/
