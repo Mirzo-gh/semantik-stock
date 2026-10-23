@@ -145,10 +145,57 @@ def daily_arguments(files: pathlib.Path, models: pathlib.Path) -> list:
         arguments += ["--difficulty", str(files / "difficulty.tsv")]
     if (files / "cleanup_from.txt").exists():
         arguments += ["--cleanup-from", (files / "cleanup_from.txt").read_text().strip(), "--names", str(files / "filter_names.tsv")]
+    if (files / "start_from.txt").exists():
+        arguments += ["--start-from", (files / "start_from.txt").read_text().strip(), "--start-exclude", str(files / "vocab_blocklist.txt"), str(files / "filter_lemmas.tsv"), str(files / "filter_names.tsv")]
     pos_file = files / "pos_lemmas.tsv"
     if pos_file.exists() and pos_file.stat().st_size > 0:
         arguments += ["--pos", str(pos_file)]
     return arguments
+
+
+def pipeline_command(data: pathlib.Path, date: datetime.date, number: int, candidates: pathlib.Path, work: pathlib.Path, files: pathlib.Path, models: pathlib.Path) -> list:
+    command = [sys.executable, "-m", "semantik_pipeline.cli", "daily", "--data", str(data), "--date", date.isoformat(), "--number", str(number), "--candidates", str(candidates), "--pinned", str(work / "pinned")]
+    return command + daily_arguments(files, models)
+
+
+def check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last) -> None:
+    """Essai à blanc de l'activation du mot de départ : regénère (dans un dossier à part) les jours du stock qui seraient supprimés, puis exige
+    « mêmes mots, mêmes scores, plus start ». Ne touche ni R2 ni le stock ; le journal ne donne que des compteurs."""
+    start_from = int((files / "start_from.txt").read_text().strip())
+    first = max(start_from, today_number + 3, stock_first)  # le jour courant, J+1 et J+2 sont en ligne : jamais refaits
+    if first > stock_last:
+        log("Mot de départ : aucun jour du stock à comparer (stock plus court que le premier jour concerné)")
+        return
+    sys.path.insert(0, str(HERE / "pipeline"))
+    from semantik_pipeline import start_check  # numpy requis, comme le pipeline
+
+    simulated = work / "data-start-check"
+    shutil.rmtree(simulated, ignore_errors=True)
+    simulated.mkdir()
+    for item in data.iterdir():
+        if item.name != "daily":
+            (simulated / item.name).symlink_to(item.resolve())
+    (simulated / "daily").mkdir()
+    for path in daily_dir.glob("*.json"):
+        if int(path.stem) < first:
+            shutil.copyfile(path, simulated / "daily" / path.name)
+    date = launch + datetime.timedelta(days=stock_last - 1)
+    run_silent("essai à blanc du mot de départ", pipeline_command(simulated, date, stock_last, candidates, work, files, models), cwd=work, env=environment)
+    subsets = {}
+    for label, source in (("avant", daily_dir), ("apres", simulated / "daily")):  # seuls les jours qui seraient refaits sont comparés
+        subsets[label] = work / f"start-check-{label}"
+        shutil.rmtree(subsets[label], ignore_errors=True)
+        subsets[label].mkdir()
+        for path in source.glob("*.json"):
+            if int(path.stem) >= first:
+                shutil.copyfile(path, subsets[label] / path.name)
+    counts, problems = start_check.compare_days(subsets["avant"], subsets["apres"], first)
+    compared_range = f"n°{first} à {stock_last}"
+    if problems:
+        for problem in problems[:10]:
+            log(problem)
+        raise Stop(f"mot de départ : {len(problems)} écart(s) entre le stock existant et la régénération à blanc ({compared_range}) : ne rien supprimer")
+    log(f"Mot de départ : régénération à blanc identique au stock plus `start` ({counts['compared']} jours comparés, {counts['with_start']} avec start, {compared_range})")
 
 
 def sha(path: pathlib.Path) -> str:
@@ -236,17 +283,19 @@ def main() -> None:
     for path in daily_dir.glob("*.json"):
         existing[path.name] = sha(path)
     log(f"Historique chargé : {today_number - 1} jours passés, stock existant jusqu'au n°{stock_last}")
+    candidates = work / "candidates.txt"
+    candidates.write_text("\n".join(line.split("\t")[1] for line in (files / "candidates.tsv").read_text(encoding="utf-8").splitlines()[1:]) + "\n", encoding="utf-8")
+    (work / "pinned").mkdir()
+    environment = dict(os.environ, SEMANTIK_MASTER_KEY=master_key, PYTHONPATH=str(HERE / "pipeline"))
+    if dry_run and (files / "start_from.txt").exists():
+        # Mot de départ : AVANT toute suppression dans R2, on regénère à blanc les jours du stock concernés et on les compare à l'existant
+        check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last)
     if stock_last >= target_number:
         log("Stock déjà suffisant : rien à générer")
         return
 
     # 5. Génération (les jours existants sont conservés tels quels par le pipeline)
-    candidates = work / "candidates.txt"
-    candidates.write_text("\n".join(line.split("\t")[1] for line in (files / "candidates.tsv").read_text(encoding="utf-8").splitlines()[1:]) + "\n", encoding="utf-8")
-    (work / "pinned").mkdir()
-    environment = dict(os.environ, SEMANTIK_MASTER_KEY=master_key, PYTHONPATH=str(HERE / "pipeline"))
-    command = [sys.executable, "-m", "semantik_pipeline.cli", "daily", "--data", str(data), "--date", target_date.isoformat(), "--number", str(target_number), "--candidates", str(candidates), "--pinned", str(work / "pinned")]
-    command += daily_arguments(files, models)
+    command = pipeline_command(data, target_date, target_number, candidates, work, files, models)
     run_silent("génération des jours", command, cwd=work, env=environment)
 
     # 6. Contrôles : rien d'existant n'a changé, tout est là, numérotation cohérente

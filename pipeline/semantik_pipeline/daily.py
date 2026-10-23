@@ -61,8 +61,10 @@ def decode_target_index(puzzle: dict) -> int:
 
 def build_daily(vectors: np.ndarray, target_index: int, number: int, date: str,
                 vocab_hash: str, forms_hash: str, seed: int, similarities: np.ndarray | None = None,
-                pos_class: int | None = None) -> dict:
-    """`similarities` (score mélangé, voir blend.py) remplace le cosinus frWac ; sans lui, le calcul historique est inchangé."""
+                pos_class: int | None = None, start_picker=None) -> dict:
+    """`similarities` (score mélangé, voir blend.py) remplace le cosinus frWac ; sans lui, le calcul historique est inchangé.
+
+    `start_picker(scores, top)` renvoie l'index du mot de départ à 30 °C (voir start_word.py) ou None : le champ `start` n'est écrit que s'il y en a un."""
     if similarities is None:
         scores, top = stored_scores(vectors, target_index)
     else:
@@ -80,6 +82,10 @@ def build_daily(vectors: np.ndarray, target_index: int, number: int, date: str,
     if pos_class is not None:
         # Indice « nature » (optionnel, DATA_CONTRACT) : un octet masqué avec un flux neuf, comme scores et top
         puzzle["pos"] = base64.b64encode(xor_mask(bytes([pos_class]), seed)).decode()
+    start_index = start_picker(scores, top) if start_picker is not None else None
+    if start_index is not None:
+        # Mot de départ à 30 °C (optionnel, DATA_CONTRACT §4b) : index uint16 little-endian, masqué avec un flux neuf comme scores et top
+        puzzle["start"] = base64.b64encode(xor_mask(int(start_index).to_bytes(2, "little"), seed)).decode()
     return puzzle
 
 
@@ -88,6 +94,13 @@ def decode_pos(puzzle: dict) -> int | None:
     if "pos" not in puzzle:
         return None
     return xor_mask(base64.b64decode(puzzle["pos"]), puzzle["seed"])[0]
+
+
+def decode_start(puzzle: dict) -> int | None:
+    """Index du lemme du mot de départ à 30 °C ; None si le fichier n'en a pas (anciens jours)."""
+    if "start" not in puzzle:
+        return None
+    return int.from_bytes(xor_mask(base64.b64decode(puzzle["start"]), puzzle["seed"]), "little")
 
 
 def dump(daily: dict) -> str:

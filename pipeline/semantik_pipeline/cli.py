@@ -14,7 +14,7 @@ import sys
 
 import numpy as np
 
-from . import blend as blend_module, daily as daily_module, difficulty as difficulty_module, vocab as vocab_module
+from . import blend as blend_module, daily as daily_module, difficulty as difficulty_module, start_word as start_word_module, vocab as vocab_module
 from .w2v import load_word2vec_binary
 
 
@@ -105,6 +105,14 @@ def command_daily(args) -> None:
         draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
         if not draw_candidates:
             sys.exit("--drop-classes retire tous les candidats")
+    # Mot de départ à 30 °C (jours >= --start-from) : fréquence frWac de data/pos.tsv, exclusions (noms propres, liste noire, filtre)
+    start_ranks = start_excluded = None
+    if args.start_from is not None:
+        pos_path = data / "pos.tsv"
+        if not pos_path.exists():
+            sys.exit("--start-from demande data/pos.tsv (rang de fréquence)")
+        start_ranks = blend_module.read_frequency_ranks(str(pos_path), lemmas)
+        start_excluded = start_word_module.read_excluded_words(args.start_exclude or [])
     target = data / "daily"
     target.mkdir(exist_ok=True)
     last_day = datetime.date.fromisoformat(args.date)
@@ -128,10 +136,16 @@ def command_daily(args) -> None:
         similarities = None
         if blending and number >= args.blend_from:
             similarities = blend_module.blended_similarities(vectors, fasttext, fasttext_present, word_index, senses.get(word), associations.get(word), frequency_ranks, cleanup_penalties if cleanup_penalties is not None and number >= args.cleanup_from else filter_penalties, exclusions.get(word), **(blend_module.V3_SETTINGS if args.v3_from is not None and number >= args.v3_from else blend_module.CURRENT_SETTINGS))
+        start_picker = None
+        if args.start_from is not None and number >= args.start_from:
+            def start_picker(scores, top, day=day, word_index=word_index):
+                index, half_width, count = start_word_module.choose_start(master_key, day, lemmas, scores, top, word_index, start_ranks, start_excluded)
+                print(f"n°{number} départ : {count} candidats (bande ±{half_width / 100:g} °C)" + ("" if index is not None else ", AUCUN"), file=sys.stderr)  # jamais le mot
+                return index
         puzzle = daily_module.build_daily(
             vectors, word_index, number, day,
             lemma_file.name.split(".")[1], forms_file.name.split(".")[1],
-            daily_module.derive_seed(master_key, day), similarities, pos_classes.get(word),
+            daily_module.derive_seed(master_key, day), similarities, pos_classes.get(word), start_picker,
         )
         path.write_text(daily_module.dump(puzzle))
 
@@ -196,6 +210,8 @@ def main() -> None:
     daily.add_argument("--difficulty", help="pipeline/difficulty.tsv (mot, essais simulés, classe) ; avec --drop-classes")
     daily.add_argument("--drop-classes", default="dx", help="classes de difficulté retirées du tirage (défaut « dx » : difficile et non trouvé)")
     daily.add_argument("--v3-from", type=int, help="numéro du premier jour calculé avec le rééquilibrage V3 (fastText 0,35, JDM β 4,5, pénalité sans association) ; absent : calcul actuel. Bascule datée : les jours déjà publiés ne changent jamais")
+    daily.add_argument("--start-from", type=int, help="numéro du premier jour qui reçoit un mot de départ à 30 °C (champ `start`) ; absent : aucun. Bascule datée, les jours déjà publiés ne changent jamais")
+    daily.add_argument("--start-exclude", nargs="+", help="fichiers de mots jamais proposés comme départ (vocab_blocklist.txt, filter_lemmas.tsv, filter_names.tsv), avec --start-from")
     daily.set_defaults(handler=command_daily)
     plan = commands.add_parser("plan")
     plan.add_argument("--data", required=True)
