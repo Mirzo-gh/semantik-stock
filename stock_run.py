@@ -14,9 +14,12 @@ lus avec lui et ÉPINGLÉS ; sans jeton, ou si la lecture échoue, on s'arrête 
 Essais hors ligne : STOCK_LOCAL_STORAGE=<dossier miroir du bucket>, STOCK_LOCAL_SITE=<dossier miroir de /data/daily du site> ;
 STOCK_LOCAL_SITE_MASKED=<numéros séparés par des virgules> : ces jours du miroir ne sont servis qu'avec le bon jeton (STOCK_LOCAL_SITE_TOKEN).
 """
+import array
+import base64
 import concurrent.futures
 import datetime
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -211,6 +214,37 @@ def sha(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+SCORE_TOLERANCE = 1  # unité stockée = 0,01 °C : un jour généré sur Mac et le même sur Linux diffèrent d'au plus 1 sur certains scores
+
+
+def same_published_day(stock_copy: pathlib.Path, published: pathlib.Path) -> bool:
+    """Même jour publié ? Octet pour octet, sinon : mêmes champs hors scores/start, même `top` (mêmes mots, même ordre) et scores à ±SCORE_TOLERANCE.
+    `start` est un indice dérivé des scores : il peut varier de ±1 sans changer de mot du jour, donc il n'entre pas dans la comparaison."""
+    if sha(stock_copy) == sha(published):
+        return True
+    try:
+        stock_day, published_day = json.loads(stock_copy.read_text()), json.loads(published.read_text())
+        if not isinstance(stock_day, dict) or not isinstance(published_day, dict):
+            return False
+        ignored = {"scores", "start"}
+        if {key: value for key, value in stock_day.items() if key not in ignored} != {key: value for key, value in published_day.items() if key not in ignored}:
+            return False  # inclut `top` (même graine, donc mêmes octets masqués = mêmes mots dans le même ordre), seed, vocab, forms, pos
+        spec = importlib.util.spec_from_file_location("stock_masking", HERE / "pipeline" / "semantik_pipeline" / "masking.py")
+        masking = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(masking)
+        seed = published_day["seed"]
+        decoded = []
+        for day in (stock_day, published_day):
+            values = array.array("H")
+            values.frombytes(masking.xor_mask(base64.b64decode(day["scores"]), seed))
+            decoded.append(values)
+        if len(decoded[0]) != len(decoded[1]):
+            return False
+        return all(abs(left - right) <= SCORE_TOLERANCE for left, right in zip(*decoded))
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
 def main() -> None:
     dry_run = os.environ.get("STOCK_DRY_RUN") == "1"
     days_ahead = int(os.environ.get("STOCK_DAYS_AHEAD", "90"))
@@ -305,9 +339,9 @@ def main() -> None:
             raise Stop(f"jour n°{number} illisible (JSON invalide) : arrêt") from None
         if pinned_day.get("n") != number or pinned_day.get("vocab") != vocab_hash:
             raise Stop(f"jour n°{number} : numéro ou vocabulaire inattendu : arrêt")
-    # Garde-fou : un jour J..J+2 déjà dans le stock doit être IDENTIQUE à la prod (octet pour octet). Sinon le stock est sur une autre chaîne de mots
+    # Garde-fou : un jour J..J+2 déjà dans le stock doit être le MÊME que la prod (mêmes mots, même ordre, scores à ±1 près : Mac/Linux). Sinon le stock est sur une autre chaîne de mots
     # (le tirage dépend de l'historique) : arrêt, rien n'est généré ni déposé ; refaire le stock à partir des jours publiés.
-    differing = [path.stem for path in sorted(stock_copies.glob("*.json")) if sha(path) != sha(daily_dir / path.name)]
+    differing = [path.stem for path in sorted(stock_copies.glob("*.json")) if not same_published_day(path, daily_dir / path.name)]
     if differing:
         raise Stop(f"{len(differing)} jour(s) du stock parmi J..J+2 (n°{', n°'.join(differing)}) diffèrent de la prod : arrêt, le stock n'est pas sur la chaîne publiée")
     for path in daily_dir.glob("*.json"):
