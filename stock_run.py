@@ -9,7 +9,7 @@ Données lues dans R2 privé (jamais commitées) : pipeline-data/pipeline-files.
 (vocabulaire + vecteurs construits par le déploiement local), fasttext/ft.npz, exclusions/exclusions.tsv. Le vocabulaire n'est JAMAIS écrit ici :
 si celui de la prod n'est plus celui des données, on s'arrête (il faut republier les données depuis le Mac : scripts/local-deploy.sh --publish-data).
 Env : SEMANTIK_MASTER_KEY, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY ; STOCK_DAYS_AHEAD (défaut 90) ; STOCK_DRY_RUN=1 (rien n'est écrit).
-DEPLOY_CHECK_TOKEN (obligatoire) : jeton de lecture des jours futurs en ligne (en-tête X-Deploy-Check, HMAC du secret de session, comme le Deploy). J+1 et J+2 sont
+DEPLOY_CHECK_TOKEN (facultatif ; sans lui, J+1 et J+2 sont repris du stock R2 avec un avertissement et arrêt s'ils y manquent, sans comparaison à la prod) : jeton de lecture des jours futurs en ligne (en-tête X-Deploy-Check, HMAC du secret de session, comme le Deploy). J+1 et J+2 sont
 lus avec lui et ÉPINGLÉS ; sans jeton, ou si la lecture échoue, on s'arrête : jamais de tirage à frais pour un jour déjà publié.
 Essais hors ligne : STOCK_LOCAL_STORAGE=<dossier miroir du bucket>, STOCK_LOCAL_SITE=<dossier miroir de /data/daily du site> ;
 STOCK_LOCAL_SITE_MASKED=<numéros séparés par des virgules> : ces jours du miroir ne sont servis qu'avec le bon jeton (STOCK_LOCAL_SITE_TOKEN).
@@ -220,9 +220,7 @@ def main() -> None:
     work = pathlib.Path(os.environ.get("STOCK_WORK", "work")).resolve()
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True)
-    deploy_token = os.environ.get("DEPLOY_CHECK_TOKEN", "")
-    if not deploy_token:
-        raise Stop("jeton DEPLOY_CHECK_TOKEN absent : J+1 et J+2 ne peuvent pas être épinglés, arrêt")
+    deploy_token = os.environ.get("DEPLOY_CHECK_TOKEN", "")  # facultatif : sans lui, J+1 et J+2 sont repris du stock (voir plus bas)
     storage = Storage()
     log(f"Mode : {'ESSAI (rien n’est écrit)' if dry_run else 'RÉEL'} ; avance visée : {days_ahead} jours")
 
@@ -291,14 +289,22 @@ def main() -> None:
     # le stock en avait une autre version. Pas de jeton ou lecture impossible : arrêt, jamais de tirage à frais pour un jour déjà publié (cela décalerait tout).
     for number in (today_number + 1, today_number + 2):
         destination = daily_dir / f"{number}.json"
-        if site_get(f"daily/{number}.json", destination, deploy_token) != "present":
-            raise Stop(f"jour n°{number} (J+{number - today_number}) illisible en ligne avec le jeton : arrêt, aucun tirage à frais pour un jour déjà publié")
+        if deploy_token:
+            if site_get(f"daily/{number}.json", destination, deploy_token) != "present":
+                raise Stop(f"jour n°{number} (J+{number - today_number}) illisible en ligne avec le jeton : arrêt, aucun tirage à frais pour un jour déjà publié")
+        else:
+            # Sans jeton (secret de session indisponible) : le stock fait foi pour J+1 et J+2, sans comparaison possible à la prod ; s'il y manque un jour, arrêt
+            stock_copy = stock_copies / f"{number}.json"
+            if not stock_copy.exists():
+                raise Stop(f"jeton absent et jour n°{number} (J+{number - today_number}) absent du stock : arrêt, aucun tirage à frais pour un jour déjà publié")
+            shutil.copyfile(stock_copy, destination)
+            log(f"AVERTISSEMENT : jeton absent, jour n°{number} repris du stock sans comparaison à la prod")
         try:
             pinned_day = json.loads(destination.read_text())
         except ValueError:
-            raise Stop(f"jour n°{number} en ligne illisible (JSON invalide) : arrêt") from None
+            raise Stop(f"jour n°{number} illisible (JSON invalide) : arrêt") from None
         if pinned_day.get("n") != number or pinned_day.get("vocab") != vocab_hash:
-            raise Stop(f"jour n°{number} en ligne : numéro ou vocabulaire inattendu : arrêt")
+            raise Stop(f"jour n°{number} : numéro ou vocabulaire inattendu : arrêt")
     # Garde-fou : un jour J..J+2 déjà dans le stock doit être IDENTIQUE à la prod (octet pour octet). Sinon le stock est sur une autre chaîne de mots
     # (le tirage dépend de l'historique) : arrêt, rien n'est généré ni déposé ; refaire le stock à partir des jours publiés.
     differing = [path.stem for path in sorted(stock_copies.glob("*.json")) if sha(path) != sha(daily_dir / path.name)]
