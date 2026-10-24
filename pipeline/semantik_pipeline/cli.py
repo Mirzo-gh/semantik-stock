@@ -232,6 +232,22 @@ def command_change(args) -> None:
     print(f"changement n°{args.number} : mode {request.get('mode', '?')}, {'refusé' if resolution['codes'] else 'accepté'} ({','.join(resolution['codes']) or 'ok'})")  # jamais le mot
 
 
+def command_pool(args) -> None:
+    """Export admin/pool.json : candidats de tirage (ceux sur lesquels `change` décide not_candidate) et mots de tous les jours 1..--last. Fichier PRIVÉ, jamais affiché."""
+    data = pathlib.Path(args.data)
+    lemmas = next(data.glob("lemmas.*.txt")).read_text(encoding="utf-8").splitlines()
+    candidates = read_lines(args.candidates)
+    draw_candidates = candidates
+    if args.difficulty:
+        draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    days = change_module.history_words(data / "daily", lemmas, args.last + 1)
+    if days is None:
+        sys.exit("jour manquant : export du pool impossible")
+    pool = {"v": 1, "at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "candidates": list(dict.fromkeys(draw_candidates)), "days": days}
+    pathlib.Path(args.out).write_text(json.dumps(pool, ensure_ascii=False), encoding="utf-8")
+    print(f"pool : {len(pool['candidates'])} candidats, {len(days)} jours")  # des nombres seulement
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="semantik_pipeline")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -275,6 +291,14 @@ def main() -> None:
     change.add_argument("--exclusions")
     change.add_argument("--out", required=True, help="fichier PRIVÉ de résolution (contient le mot)")
     change.set_defaults(handler=command_change)
+    pool = commands.add_parser("pool")
+    pool.add_argument("--data", required=True)
+    pool.add_argument("--last", type=int, required=True, help="dernier jour du stock")
+    pool.add_argument("--candidates", required=True)
+    pool.add_argument("--difficulty")
+    pool.add_argument("--drop-classes", default="dx")
+    pool.add_argument("--out", required=True, help="fichier PRIVÉ (contient les mots)")
+    pool.set_defaults(handler=command_pool)
     plan = commands.add_parser("plan")
     plan.add_argument("--data", required=True)
     plan.add_argument("--candidates", required=True)

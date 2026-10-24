@@ -216,6 +216,17 @@ def write_result(storage: "Storage", work: pathlib.Path, number: int, mode: str,
     log(f"Résultat du changement n°{number} : {status}" + (f" ({', '.join(codes)})" if codes else ""))
 
 
+def export_pool(storage: "Storage", work: pathlib.Path, data: pathlib.Path, files: pathlib.Path, candidates: pathlib.Path, environment: dict, last: int) -> None:
+    """admin/pool.json (R2 privé, lu par l'admin) : candidats de tirage et mots en clair des jours 1..last. Écrit seulement dans un run réel, jamais journalisé ni commité."""
+    pool_path = work / "pool.json"
+    command = [sys.executable, "-m", "semantik_pipeline.cli", "pool", "--data", str(data), "--last", str(last), "--candidates", str(candidates), "--out", str(pool_path)]
+    if (files / "difficulty.tsv").exists():
+        command += ["--difficulty", str(files / "difficulty.tsv")]
+    run_silent("export du pool admin", command, cwd=work, env=environment)
+    storage.put("admin/pool.json", pool_path)
+    log("Pool admin exporté.")
+
+
 def check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last) -> None:
     """Essai à blanc de l'activation du mot de départ : regénère (dans un dossier à part) les jours du stock qui seraient supprimés, puis exige
     « mêmes mots, mêmes scores, plus start ». Ne touche ni R2 ni le stock ; le journal ne donne que des compteurs."""
@@ -499,6 +510,8 @@ def main() -> None:
         target_number = max(target_number, old_stock_last)
     if stock_last >= target_number:
         log("Stock déjà suffisant : rien à générer")
+        if not dry_run:
+            export_pool(storage, work, data, files, candidates, environment, stock_last)
         return
 
     # 5. Génération (les jours existants sont conservés tels quels par le pipeline)
@@ -539,6 +552,7 @@ def main() -> None:
     if not storage.get(f"{STOCK_PREFIX}{target_number}.json", check) or sha(check) != sha(daily_dir / f"{target_number}.json"):
         raise Stop("vérification du dernier jour déposé en échec")
     log(f"Stock à jour : jours n°{today_number} à {target_number} ({len(new_numbers)} déposés).")
+    export_pool(storage, work, data, files, candidates, environment, target_number)
     if change_number:
         finish_change(int(change_number), storage, work, target_number)
 
