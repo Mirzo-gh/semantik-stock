@@ -5,11 +5,8 @@ name: change
 on:
   workflow_dispatch:
     inputs:
-      n:
-        description: "Numéro du jour dont le mot change (>= J+3)"
-        type: string
       number:
-        description: "Idem (nom alternatif de n : l'un des deux est requis)"
+        description: "Numéro du jour dont le mot change (>= J+3)"
         type: string
       dry_run:
         description: "Aperçu : contrôle le mot et écrit seulement le résultat, ne change rien"
@@ -41,7 +38,7 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           DEPLOY_CHECK_TOKEN: ${{ secrets.DEPLOY_CHECK_TOKEN }}
-          STOCK_CHANGE_NUMBER: ${{ inputs.n || inputs.number }}
+          STOCK_CHANGE_NUMBER: ${{ inputs.number }}
           STOCK_CHANGE_REQUIRED: '1'  # sans numéro, ce workflow ne doit jamais se rabattre sur un run de stock ordinaire
           STOCK_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
           STOCK_DAYS_AHEAD: '90'
