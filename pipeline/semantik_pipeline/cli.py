@@ -14,7 +14,7 @@ import sys
 
 import numpy as np
 
-from . import blend as blend_module, daily as daily_module, difficulty as difficulty_module, start_word as start_word_module, vocab as vocab_module
+from . import blend as blend_module, change as change_module, daily as daily_module, difficulty as difficulty_module, start_word as start_word_module, vocab as vocab_module
 from .w2v import load_word2vec_binary
 
 
@@ -46,6 +46,25 @@ def read_pos_classes(path: str) -> dict[str, int]:
         if lemma and label.strip().isdigit() and 0 <= int(label) <= 4:
             classes[lemma] = int(label)
     return classes
+
+
+def read_forced_words(path: str) -> dict[int, str]:
+    """Fichier PRIVÉ numéro<TAB>mot (décision admin : mot choisi pour un jour futur). Lignes vides et « # » ignorées."""
+    forced: dict[int, str] = {}
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        number, _, word = line.partition("\t")
+        if not number.strip().isdigit() or not word.strip():
+            sys.exit("--force-word-file : ligne illisible (attendu : numéro<TAB>mot)")
+        forced[int(number)] = word.strip()
+    return forced
+
+
+def check_forced_word(number: int, word: str, history: list[str], lemma_set: set[str], draw_candidates: list[str]) -> None:
+    """Un mot imposé doit être jouable (voir change.word_problems). Les messages ne contiennent que le numéro du jour, jamais le mot."""
+    for code in change_module.word_problems(word, history, lemma_set, draw_candidates):
+        sys.exit(f"n°{number} : mot imposé refusé ({change_module.REFUSAL_TEXTS[code]})")
 
 
 def command_daily(args) -> None:
@@ -113,6 +132,7 @@ def command_daily(args) -> None:
             sys.exit("--start-from demande data/pos.tsv (rang de fréquence)")
         start_ranks = blend_module.read_frequency_ranks(str(pos_path), lemmas)
         start_excluded = start_word_module.read_excluded_words(args.start_exclude or [])
+    forced_words = read_forced_words(args.force_word_file) if args.force_word_file else {}
     target = data / "daily"
     target.mkdir(exist_ok=True)
     last_day = datetime.date.fromisoformat(args.date)
@@ -125,7 +145,11 @@ def command_daily(args) -> None:
             history.append(lemmas[daily_module.decode_target_index(json.loads(path.read_text()))])
             continue
         pinned_file = pathlib.Path(args.pinned, "daily", f"{number}.json") if args.pinned else None
-        if pinned_file is not None and pinned_file.exists():
+        if number in forced_words:
+            # Mot imposé (admin, jour futur) : prime sur l'épingle et sur le tirage ; l'historique des jours suivants en tient compte
+            word = forced_words[number]
+            check_forced_word(number, word, history, lemma_set, draw_candidates)
+        elif pinned_file is not None and pinned_file.exists():
             # Jour régénéré sur un nouveau vocabulaire : on garde EXACTEMENT le mot déjà publié (l'index reste valable : vocabulaire append-only)
             word = lemmas[daily_module.decode_target_index(json.loads(pinned_file.read_text()))]
         else:
@@ -181,6 +205,33 @@ def command_plan(args) -> None:
         print(f"{args.days} jours (n°{first} à {number - 1}) -> fichier privé, aucun mot affiché")
 
 
+def command_change(args) -> None:
+    """Contrôle et résolution d'une demande de changement de mot (admin). Écrit {codes, word, neighbours_unreviewed} dans --out : fichier PRIVÉ, jamais affiché."""
+    master_key = os.environ.get("SEMANTIK_MASTER_KEY", "").encode()
+    if not master_key:
+        sys.exit("SEMANTIK_MASTER_KEY absente")
+    data = pathlib.Path(args.data)
+    lemmas = next(data.glob("lemmas.*.txt")).read_text(encoding="utf-8").splitlines()
+    candidates = read_lines(args.candidates)
+    draw_candidates = candidates
+    if args.difficulty:
+        draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    try:
+        request = json.loads(pathlib.Path(args.request).read_text(encoding="utf-8"))
+        if not isinstance(request, dict):
+            raise ValueError
+    except ValueError:
+        request = {}
+    daily_dir = data / "daily"
+    history = change_module.history_words(daily_dir, lemmas, args.number)
+    old_path = daily_dir / f"{args.number}.json"
+    old_word = lemmas[daily_module.decode_target_index(json.loads(old_path.read_text()))] if old_path.exists() else ""
+    exclusions_text = pathlib.Path(args.exclusions).read_text(encoding="utf-8") if args.exclusions and pathlib.Path(args.exclusions).exists() else None
+    resolution = change_module.resolve(request, history, lemmas, draw_candidates, old_word, master_key, exclusions_text)
+    pathlib.Path(args.out).write_text(json.dumps(resolution), encoding="utf-8")
+    print(f"changement n°{args.number} : mode {request.get('mode', '?')}, {'refusé' if resolution['codes'] else 'accepté'} ({','.join(resolution['codes']) or 'ok'})")  # jamais le mot
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="semantik_pipeline")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -197,6 +248,7 @@ def main() -> None:
     daily.add_argument("--date", required=True)
     daily.add_argument("--number", type=int, required=True)
     daily.add_argument("--candidates", required=True)
+    daily.add_argument("--force-word-file", help="fichier PRIVÉ numéro<TAB>mot : mot imposé pour ces jours (futurs, pas encore générés) ; jamais affiché")
     daily.add_argument("--pinned", help="dossier contenant daily/<n>.json dont le mot secret doit être conservé (jours régénérés)")
     daily.add_argument("--blend-from", type=int, help="numéro du premier jour calculé avec le score mélangé (absent : calcul historique pour tous)")
     daily.add_argument("--fasttext", help="vecteurs fastText précalculés (ft.npz), requis avec --blend-from")
@@ -213,6 +265,16 @@ def main() -> None:
     daily.add_argument("--start-from", type=int, help="numéro du premier jour qui reçoit un mot de départ à 30 °C (champ `start`) ; absent : aucun. Bascule datée, les jours déjà publiés ne changent jamais")
     daily.add_argument("--start-exclude", nargs="+", help="fichiers de mots jamais proposés comme départ (vocab_blocklist.txt, filter_lemmas.tsv, filter_names.tsv), avec --start-from")
     daily.set_defaults(handler=command_daily)
+    change = commands.add_parser("change")
+    change.add_argument("--data", required=True)
+    change.add_argument("--number", type=int, required=True)
+    change.add_argument("--request", required=True, help="demande JSON {mode: word|redraw|revert, word?, nonce?} (PRIVÉE)")
+    change.add_argument("--candidates", required=True)
+    change.add_argument("--difficulty")
+    change.add_argument("--drop-classes", default="dx")
+    change.add_argument("--exclusions")
+    change.add_argument("--out", required=True, help="fichier PRIVÉ de résolution (contient le mot)")
+    change.set_defaults(handler=command_change)
     plan = commands.add_parser("plan")
     plan.add_argument("--data", required=True)
     plan.add_argument("--candidates", required=True)

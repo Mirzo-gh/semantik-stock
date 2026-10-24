@@ -11,6 +11,9 @@ si celui de la prod n'est plus celui des données, on s'arrête (il faut republi
 Env : SEMANTIK_MASTER_KEY, R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY ; STOCK_DAYS_AHEAD (défaut 90) ; STOCK_DRY_RUN=1 (rien n'est écrit).
 DEPLOY_CHECK_TOKEN (facultatif ; sans lui, J+1 et J+2 sont repris du stock R2 avec un avertissement et arrêt s'ils y manquent, sans comparaison à la prod) : jeton de lecture des jours futurs en ligne (en-tête X-Deploy-Check, HMAC du secret de session, comme le Deploy). J+1 et J+2 sont
 lus avec lui et ÉPINGLÉS ; sans jeton, ou si la lecture échoue, on s'arrête : jamais de tirage à frais pour un jour déjà publié.
+STOCK_CHANGE_NUMBER (workflow change.yml) : numéro d'un jour futur (>= J+3) dont l'admin a demandé le changement de mot. La demande est lue dans R2 privé
+(admin/requests/<n>.json, jamais dans une entrée du workflow) ; le résultat (codes et booléens seulement, aucun mot) est écrit dans admin/results/<n>.json. Les mots
+imposés vivent dans admin/overrides.tsv (numéro<TAB>mot, PRIVÉ), relu à chaque run et par le Deploy local.
 Essais hors ligne : STOCK_LOCAL_STORAGE=<dossier miroir du bucket>, STOCK_LOCAL_SITE=<dossier miroir de /data/daily du site> ;
 STOCK_LOCAL_SITE_MASKED=<numéros séparés par des virgules> : ces jours du miroir ne sont servis qu'avec le bon jeton (STOCK_LOCAL_SITE_TOKEN).
 """
@@ -41,6 +44,10 @@ SILENT_LOG = pathlib.Path(tempfile.mkdtemp(prefix="stock-silent-")) / "tools.log
 
 class Stop(Exception):
     """Arrêt contrôlé : le message est PUBLIC, il ne contient jamais de donnée."""
+
+
+class Refused(Exception):
+    """Demande de changement de mot refusée (résultat déjà écrit dans R2) : le run sort en échec pour qu'un essai refusé ne compte jamais comme un essai réussi."""
 
 
 def log(message: str) -> None:
@@ -89,6 +96,15 @@ class Storage:
             if code in ("404", "NoSuchKey", "NotFound"):
                 return False
             raise Stop(f"lecture R2 impossible ({type(error).__name__})") from None
+
+    def delete(self, key: str) -> None:
+        if self.local:
+            (pathlib.Path(self.local) / key).unlink(missing_ok=True)
+            return
+        try:
+            self.client.delete_object(Bucket=BUCKET, Key=key)
+        except Exception as error:  # noqa: BLE001
+            raise Stop(f"suppression R2 impossible ({type(error).__name__})") from None
 
     def put(self, key: str, source: pathlib.Path) -> None:
         if self.local:
@@ -165,9 +181,39 @@ def daily_arguments(files: pathlib.Path, models: pathlib.Path) -> list:
     return arguments
 
 
-def pipeline_command(data: pathlib.Path, date: datetime.date, number: int, candidates: pathlib.Path, work: pathlib.Path, files: pathlib.Path, models: pathlib.Path) -> list:
+def pipeline_command(data: pathlib.Path, date: datetime.date, number: int, candidates: pathlib.Path, work: pathlib.Path, files: pathlib.Path, models: pathlib.Path, overrides: pathlib.Path | None = None) -> list:
     command = [sys.executable, "-m", "semantik_pipeline.cli", "daily", "--data", str(data), "--date", date.isoformat(), "--number", str(number), "--candidates", str(candidates), "--pinned", str(work / "pinned")]
+    if overrides is not None and overrides.exists() and overrides.stat().st_size > 0:
+        command += ["--force-word-file", str(overrides)]  # mots imposés par l'admin (PRIVÉ) ; les jours déjà générés ne sont pas touchés
     return command + daily_arguments(files, models)
+
+
+OVERRIDES_KEY = "admin/overrides.tsv"
+CHANGE_CONTEXT: dict = {}  # numéro/mode/stockage de la demande en cours : sert à écrire un résultat « error » si le run s'arrête
+
+
+def read_overrides(path: pathlib.Path) -> dict:
+    table: dict = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            number, _, word = line.partition("\t")
+            if number.strip().isdigit() and word.strip():
+                table[int(number)] = word.strip()
+    return table
+
+
+def write_overrides(path: pathlib.Path, table: dict) -> None:
+    path.write_text("".join(f"{number}\t{word}\n" for number, word in sorted(table.items())), encoding="utf-8")
+
+
+def write_result(storage: "Storage", work: pathlib.Path, number: int, mode: str, status: str, codes: list, unreviewed, stock_last: int, dry_run: bool) -> None:
+    """admin/results/<n>.json : statut, codes de refus et booléens seulement. Jamais un mot, une taille de mot ni un indice dérivé (le journal et ce fichier sont lus au-delà du secret)."""
+    result = {"v": 1, "number": number, "mode": mode, "status": status, "codes": codes, "neighbours_unreviewed": unreviewed, "dry_run": dry_run,
+              "stock_last": stock_last, "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    path = work / f"result-{number}.json"
+    path.write_text(json.dumps(result))
+    storage.put(f"admin/results/{number}.json", path)
+    log(f"Résultat du changement n°{number} : {status}" + (f" ({', '.join(codes)})" if codes else ""))
 
 
 def check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last) -> None:
@@ -245,6 +291,89 @@ def same_published_day(stock_copy: pathlib.Path, published: pathlib.Path) -> boo
         return False
 
 
+def prepare_change(number: int, storage: "Storage", work: pathlib.Path, data: pathlib.Path, daily_dir: pathlib.Path, files: pathlib.Path, models: pathlib.Path,
+                   candidates: pathlib.Path, environment: dict, overrides: pathlib.Path, existing: dict, today_number: int, stock_first: int, stock_last: int, dry_run: bool):
+    """Demande de changement de mot (jour futur >= J+3). Renvoie le nouveau dernier jour du stock (purgé à partir de N) pour que la génération continue,
+    ou None si simple aperçu (résultat écrit) ; une demande refusée lève Refused (résultat écrit). Rien n'est affiché de ce qui touche au mot : codes et booléens seulement."""
+    request_path = work / "request.json"
+    if not storage.get(f"admin/requests/{number}.json", request_path):
+        write_result(storage, work, number, "?", "refused", ["no_request"], None, stock_last, dry_run)
+        raise Refused()
+    try:
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        mode = request.get("mode") if isinstance(request, dict) else None
+    except ValueError:
+        mode = None
+    if mode not in ("word", "redraw", "revert"):
+        write_result(storage, work, number, "?", "refused", ["bad_request"], None, stock_last, dry_run)
+        raise Refused()
+    CHANGE_CONTEXT.update(number=number, mode=mode, storage=storage, work=work, stock_last=stock_last, dry_run=dry_run)
+    if number <= today_number + 2:
+        write_result(storage, work, number, mode, "refused", ["protected"], None, stock_last, dry_run)  # J..J+2 : hors bouton (Deploy local)
+        raise Refused()
+    if number > stock_last or number < stock_first:
+        write_result(storage, work, number, mode, "refused", ["out_of_stock"], None, stock_last, dry_run)
+        raise Refused()
+    resolution_path = work / "resolution.json"
+    command = [sys.executable, "-m", "semantik_pipeline.cli", "change", "--data", str(data), "--number", str(number), "--request", str(request_path),
+               "--candidates", str(candidates), "--out", str(resolution_path)]
+    if (files / "difficulty.tsv").exists():
+        command += ["--difficulty", str(files / "difficulty.tsv")]
+    if (models / "exclusions.tsv").exists():
+        command += ["--exclusions", str(models / "exclusions.tsv")]
+    run_silent("contrôle du changement de mot", command, cwd=work, env=environment)
+    resolution = json.loads(resolution_path.read_text(encoding="utf-8"))
+    if resolution["codes"]:
+        write_result(storage, work, number, mode, "refused", resolution["codes"], None, stock_last, dry_run)
+        raise Refused()
+    unreviewed = resolution["neighbours_unreviewed"]
+    CHANGE_CONTEXT["unreviewed"] = unreviewed
+    if dry_run:
+        write_result(storage, work, number, mode, "ok", [], unreviewed, stock_last, True)  # aperçu : mot accepté, rien n'est modifié
+        log("ESSAI : rien n'a été modifié dans R2.")
+        return None
+
+    # Changement réel. 1. sauvegarde de l'ancien fichier du jour, 2. mot imposé inscrit (avant toute purge : une reprise le retrouve), 3. purge du stock >= N
+    old_file = daily_dir / f"{number}.json"
+    storage.put(f"admin/backup/{number}-{sha(old_file)[:8]}.json", old_file)
+    table = read_overrides(overrides)
+    if mode == "revert":
+        table.pop(number, None)
+    else:
+        table[number] = resolution["word"]
+    write_overrides(overrides, table)
+    storage.put(OVERRIDES_KEY, overrides)
+    kept = work / "manifest-purge.json"
+    kept.write_text(json.dumps({"v": 1, "first": stock_first, "last": number - 1, "updated": datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+    storage.put(STOCK_PREFIX + "manifest.json", kept)
+    for purged in range(number, stock_last + 1):
+        storage.delete(f"{STOCK_PREFIX}{purged}.json")
+        (daily_dir / f"{purged}.json").unlink(missing_ok=True)
+        existing.pop(f"{purged}.json", None)
+    log(f"Stock purgé à partir du n°{number} ({stock_last - number + 1} jours) ; régénération sur la nouvelle chaîne")
+    return number - 1
+
+
+def finish_change(number: int, storage: "Storage", work: pathlib.Path, stock_last: int) -> None:
+    """Fin d'un changement réel : résultat, audit sans mot, demande supprimée (seulement après succès)."""
+    mode = CHANGE_CONTEXT.get("mode", "?")
+    write_result(storage, work, number, mode, "ok", [], CHANGE_CONTEXT.get("unreviewed"), stock_last, False)
+    audit = work / "audit.json"
+    audit.write_text(json.dumps({"v": 1, "number": number, "mode": mode, "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+    storage.put(f"admin/audit/{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S')}-{number}.json", audit)
+    storage.delete(f"admin/requests/{number}.json")
+
+
+def report_failure() -> None:
+    """Un changement s'est arrêté après avoir commencé : on le dit dans le résultat (la demande reste, le prochain run reprend)."""
+    if not CHANGE_CONTEXT or CHANGE_CONTEXT.get("dry_run"):
+        return
+    try:
+        write_result(CHANGE_CONTEXT["storage"], CHANGE_CONTEXT["work"], CHANGE_CONTEXT["number"], CHANGE_CONTEXT["mode"], "error", ["stopped"], None, CHANGE_CONTEXT["stock_last"], False)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> None:
     dry_run = os.environ.get("STOCK_DRY_RUN") == "1"
     days_ahead = int(os.environ.get("STOCK_DAYS_AHEAD", "90"))
@@ -275,7 +404,9 @@ def main() -> None:
         if bundle_info.get("ft_sha256") and sha(models / "ft.npz") != bundle_info["ft_sha256"]:
             raise Stop("vecteurs fastText différents de ceux des données publiées")
         storage.get("exclusions/exclusions.tsv", models / "exclusions.tsv")
-    log("Données privées chargées")
+    overrides = work / "overrides.tsv"
+    storage.get(OVERRIDES_KEY, overrides)  # mots imposés par l'admin : absent = aucun
+    log(f"Données privées chargées ; mots imposés : {len(read_overrides(overrides))}")
 
     # 2. Le vocabulaire des données doit être celui de la prod (lecture seule, jamais réécrit)
     vocab_hash = bundle_info["lemmas"]
@@ -354,12 +485,25 @@ def main() -> None:
     if dry_run and (files / "start_from.txt").exists():
         # Mot de départ : AVANT toute suppression dans R2, on regénère à blanc les jours du stock concernés et on les compare à l'existant
         check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last)
+    change_number = os.environ.get("STOCK_CHANGE_NUMBER", "").strip()
+    old_stock_last = stock_last
+    if os.environ.get("STOCK_CHANGE_REQUIRED") == "1" and not change_number:
+        raise Stop("numéro de jour à changer absent")
+    if change_number:
+        if not change_number.isdigit():
+            raise Stop("numéro de jour à changer invalide")
+        outcome = prepare_change(int(change_number), storage, work, data, daily_dir, files, models, candidates, environment, overrides, existing, today_number, stock_first, stock_last, dry_run)
+        if outcome is None:
+            return  # refusé ou aperçu : le résultat est écrit, rien d'autre n'a changé
+        stock_last = outcome
+        target_number = max(target_number, old_stock_last)
     if stock_last >= target_number:
         log("Stock déjà suffisant : rien à générer")
         return
 
     # 5. Génération (les jours existants sont conservés tels quels par le pipeline)
-    command = pipeline_command(data, target_date, target_number, candidates, work, files, models)
+    target_date = launch + datetime.timedelta(days=target_number - 1)
+    command = pipeline_command(data, target_date, target_number, candidates, work, files, models, overrides)
     run_silent("génération des jours", command, cwd=work, env=environment)
 
     # 6. Contrôles : rien d'existant n'a changé, tout est là, numérotation cohérente
@@ -395,13 +539,19 @@ def main() -> None:
     if not storage.get(f"{STOCK_PREFIX}{target_number}.json", check) or sha(check) != sha(daily_dir / f"{target_number}.json"):
         raise Stop("vérification du dernier jour déposé en échec")
     log(f"Stock à jour : jours n°{today_number} à {target_number} ({len(new_numbers)} déposés).")
+    if change_number:
+        finish_change(int(change_number), storage, work, target_number)
 
 
 if __name__ == "__main__":
     try:
         main()
+    except Refused:
+        log("ARRÊT : changement refusé (voir le résultat)")
+        sys.exit(1)
     except Stop as stop:
         log(f"ARRÊT : {stop}")
+        report_failure()
         sys.exit(1)
     except Exception as error:  # noqa: BLE001 — le type seul, jamais le message ni la trace (ils pourraient contenir une donnée)
         log(f"ERREUR INATTENDUE : {type(error).__name__}")

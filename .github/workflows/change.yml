@@ -1,0 +1,48 @@
+# Changement du mot d'un jour futur (>= J+3) demandé depuis l'admin. DÉPÔT PUBLIC : le journal de ce workflow est public, voir stock_run.py (aucun mot, aucune taille de mot).
+# La demande (mode, mot ou nonce) est lue dans R2 privé (admin/requests/<n>.json) ; la seule entrée est le NUMÉRO du jour. Résultat : admin/results/<n>.json (codes et booléens).
+# Déclencheur : lancement manuel UNIQUEMENT (la route /change du Worker le déclenche par l'API, jamais pull_request, issue_comment, push). Même verrou que stock.yml.
+name: change
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "Numéro du jour dont le mot change (>= J+3)"
+        type: string
+      number:
+        description: "Idem (nom alternatif de n : l'un des deux est requis)"
+        type: string
+      dry_run:
+        description: "Aperçu : contrôle le mot et écrit seulement le résultat, ne change rien"
+        type: boolean
+        default: true
+permissions: {}
+concurrency:
+  group: stock
+  cancel-in-progress: false
+jobs:
+  change:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: '3.12'
+      - name: Dépendances
+        run: pip install --quiet --disable-pip-version-check -r requirements.txt
+      - name: Changement de mot, purge et régénération du stock
+        env:
+          SEMANTIK_MASTER_KEY: ${{ secrets.SEMANTIK_MASTER_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          DEPLOY_CHECK_TOKEN: ${{ secrets.DEPLOY_CHECK_TOKEN }}
+          STOCK_CHANGE_NUMBER: ${{ inputs.n || inputs.number }}
+          STOCK_CHANGE_REQUIRED: '1'  # sans numéro, ce workflow ne doit jamais se rabattre sur un run de stock ordinaire
+          STOCK_DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+          STOCK_DAYS_AHEAD: '90'
+        run: python stock_run.py
