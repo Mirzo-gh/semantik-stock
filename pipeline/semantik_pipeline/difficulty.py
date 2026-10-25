@@ -6,6 +6,8 @@
 - Classes : f (facile) < 75 essais, m (moyen) 75 à 185, d (difficile) > 185 et jusqu'à MAX_GUESSES, x (non trouvé en MAX_GUESSES essais).
 - pipeline/difficulty.tsv : `mot<TAB>essais<TAB>classe`, calculé hors CI (make_difficulty.py) ; ne dit rien de l'ordre du calendrier.
 """
+import pathlib
+
 import numpy as np
 
 MAX_GUESSES = 400
@@ -82,6 +84,30 @@ def parse_difficulty(text: str) -> dict[str, tuple[int, str]]:
     return table
 
 
-def keep_candidates(candidates: list[str], table: dict[str, tuple[int, str]], dropped_classes: str) -> list[str]:
-    """Candidats sans les classes retirées (ex. « dx »). Un candidat absent de la table reste : on ne retire jamais en silence."""
-    return [word for word in candidates if table.get(word, (0, "m"))[1] not in dropped_classes]
+DRAW_EXCLUSIONS_NAME = "draw_exclusions.txt"
+DRAW_KEEP_NAME = "candidates_keep.txt"
+DRAW_FROM_NAME = "draw_exclusions_from.txt"
+
+
+def _read_word_file(path: pathlib.Path) -> frozenset[str]:
+    if not path.exists():
+        return frozenset()
+    return frozenset(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip() and not line.startswith("#"))
+
+
+def read_draw_exclusions(difficulty_path) -> frozenset[str]:
+    """Mots retirés du TIRAGE (trop peu courants, décision humaine) : fichier `draw_exclusions.txt` à côté de difficulty.tsv, un mot par ligne (# = commentaire),
+    moins les mots rétablis à la main (`candidates_keep.txt`, même dossier). Absent : rien n'est retiré. Jamais appliqué aux jours déjà fabriqués."""
+    folder = pathlib.Path(difficulty_path).parent
+    return _read_word_file(folder / DRAW_EXCLUSIONS_NAME) - _read_word_file(folder / DRAW_KEEP_NAME)
+
+
+def read_draw_exclusions_from(difficulty_path) -> int:
+    """Premier jour (numéro) où les exclusions du tirage s'appliquent (`draw_exclusions_from.txt`) ; absent : dès le jour 1."""
+    path = pathlib.Path(difficulty_path).with_name(DRAW_FROM_NAME)
+    return int(path.read_text(encoding="utf-8").split()[0]) if path.exists() else 1
+
+
+def keep_candidates(candidates: list[str], table: dict[str, tuple[int, str]], dropped_classes: str, excluded: frozenset[str] = frozenset()) -> list[str]:
+    """Candidats sans les classes retirées (ex. « dx ») ni les mots exclus du tirage. Un candidat absent de la table reste : on ne retire jamais en silence."""
+    return [word for word in candidates if table.get(word, (0, "m"))[1] not in dropped_classes and word not in excluded]

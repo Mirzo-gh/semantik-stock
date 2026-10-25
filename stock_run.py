@@ -46,6 +46,9 @@ class Stop(Exception):
     """Arrêt contrôlé : le message est PUBLIC, il ne contient jamais de donnée."""
 
 
+REBUILD_CONTEXT: dict = {}
+
+
 class Refused(Exception):
     """Demande de changement de mot refusée (résultat déjà écrit dans R2) : le run sort en échec pour qu'un essai refusé ne compte jamais comme un essai réussi."""
 
@@ -365,6 +368,43 @@ def prepare_change(number: int, storage: "Storage", work: pathlib.Path, data: pa
     return number - 1
 
 
+def prepare_rebuild(first_number: int, storage: "Storage", work: pathlib.Path, daily_dir: pathlib.Path, existing: dict, today_number: int, stock_first: int, stock_last: int, dry_run: bool) -> int:
+    """Reconstruction du stock à partir du jour `first_number` (liste de candidats ou filtre de tirage modifié : toute la chaîne change à partir de là).
+    Les jours >= first_number sont retirés du dossier local (et, en réel seulement, de R2) puis régénérés par le tirage normal ; les jours avant restent identiques.
+    Journal : des nombres seulement (combien de jours changent de mot), jamais un mot. Renvoie le nouveau dernier jour du stock."""
+    if first_number <= today_number:
+        raise Stop("reconstruction : le jour courant et les jours passés sont protégés")
+    if first_number > stock_last:
+        raise Stop("reconstruction : numéro au-delà de la fin du stock")
+    kept = work / "rebuild-before"
+    kept.mkdir()
+    for number in range(first_number, stock_last + 1):
+        source = daily_dir / f"{number}.json"
+        if source.exists():
+            shutil.copyfile(source, kept / source.name)
+    log(f"Reconstruction à partir du n°{first_number} : {stock_last - first_number + 1} jours du stock à refaire ({'ESSAI' if dry_run else 'RÉEL'}).")
+    if not dry_run:
+        manifest = work / "manifest-rebuild.json"
+        manifest.write_text(json.dumps({"v": 1, "first": stock_first, "last": first_number - 1, "updated": datetime.datetime.now(datetime.timezone.utc).isoformat()}))
+        storage.put(STOCK_PREFIX + "manifest.json", manifest)
+        for purged in range(first_number, stock_last + 1):
+            storage.delete(f"{STOCK_PREFIX}{purged}.json")
+    for purged in range(first_number, stock_last + 1):
+        (daily_dir / f"{purged}.json").unlink(missing_ok=True)
+        existing.pop(f"{purged}.json", None)
+    REBUILD_CONTEXT["before"] = kept
+    REBUILD_CONTEXT["first"] = first_number
+    return first_number - 1
+
+
+def report_rebuild(daily_dir: pathlib.Path, last: int) -> None:
+    """Nombres seulement : combien de jours reconstruits ont changé de mot par rapport au stock d'avant."""
+    kept, first = REBUILD_CONTEXT["before"], REBUILD_CONTEXT["first"]
+    compared = [number for number in range(first, last + 1) if (kept / f"{number}.json").exists() and (daily_dir / f"{number}.json").exists()]
+    changed = [number for number in compared if not same_published_day(kept / f"{number}.json", daily_dir / f"{number}.json")]
+    log(f"Reconstruction : {len(changed)} jours sur {len(compared)} ont changé de mot (n°{first} à n°{last}).")
+
+
 def finish_change(number: int, storage: "Storage", work: pathlib.Path, stock_last: int) -> None:
     """Fin d'un changement réel : résultat, audit sans mot, demande supprimée (seulement après succès)."""
     mode = CHANGE_CONTEXT.get("mode", "?")
@@ -493,7 +533,7 @@ def main() -> None:
     candidates.write_text("\n".join(line.split("\t")[1] for line in (files / "candidates.tsv").read_text(encoding="utf-8").splitlines()[1:]) + "\n", encoding="utf-8")
     (work / "pinned").mkdir()
     environment = dict(os.environ, SEMANTIK_MASTER_KEY=master_key, PYTHONPATH=str(HERE / "pipeline"))
-    if dry_run and (files / "start_from.txt").exists():
+    if dry_run and not os.environ.get("STOCK_REBUILD_FROM") and (files / "start_from.txt").exists():  # une reconstruction change la chaîne par construction : pas de comparaison
         # Mot de départ : AVANT toute suppression dans R2, on regénère à blanc les jours du stock concernés et on les compare à l'existant
         check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last)
     change_number = os.environ.get("STOCK_CHANGE_NUMBER", "").strip()
@@ -508,6 +548,14 @@ def main() -> None:
             return  # refusé ou aperçu : le résultat est écrit, rien d'autre n'a changé
         stock_last = outcome
         target_number = max(target_number, old_stock_last)
+    rebuild_from = os.environ.get("STOCK_REBUILD_FROM", "").strip()
+    if os.environ.get("STOCK_REBUILD_REQUIRED") == "1" and not rebuild_from:
+        raise Stop("numéro de reconstruction absent")
+    if rebuild_from:
+        if not rebuild_from.isdigit() or change_number:
+            raise Stop("numéro de reconstruction invalide")
+        stock_last = prepare_rebuild(int(rebuild_from), storage, work, daily_dir, existing, today_number, stock_first, stock_last, dry_run)
+        target_number = max(target_number, old_stock_last)
     if stock_last >= target_number:
         log("Stock déjà suffisant : rien à générer")
         if not dry_run:
@@ -518,6 +566,9 @@ def main() -> None:
     target_date = launch + datetime.timedelta(days=target_number - 1)
     command = pipeline_command(data, target_date, target_number, candidates, work, files, models, overrides)
     run_silent("génération des jours", command, cwd=work, env=environment)
+
+    if rebuild_from:
+        report_rebuild(daily_dir, target_number)
 
     # 6. Contrôles : rien d'existant n'a changé, tout est là, numérotation cohérente
     for name, digest in existing.items():

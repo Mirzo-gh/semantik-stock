@@ -61,6 +61,15 @@ def read_forced_words(path: str) -> dict[int, str]:
     return forced
 
 
+def draw_pools(args, candidates: list[str]) -> tuple[list[str], list[str], int]:
+    """(tirage avant le filtre « mots communs », tirage filtré, premier jour du filtre) : le filtre ne touche que les jours >= le troisième nombre."""
+    if not args.difficulty:
+        return candidates, candidates, 1
+    base = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    excluded = difficulty_module.read_draw_exclusions(args.difficulty)
+    return base, [word for word in base if word not in excluded], difficulty_module.read_draw_exclusions_from(args.difficulty)
+
+
 def check_forced_word(number: int, word: str, history: list[str], lemma_set: set[str], draw_candidates: list[str]) -> None:
     """Un mot imposé doit être jouable (voir change.word_problems). Les messages ne contiennent que le numéro du jour, jamais le mot."""
     for code in change_module.word_problems(word, history, lemma_set, draw_candidates):
@@ -119,11 +128,9 @@ def command_daily(args) -> None:
         exclusions = blend_module.parse_exclusions(pathlib.Path(args.exclusions).read_text(encoding="utf-8"), [lemma.removeprefix("~") for lemma in lemmas])
     # Difficulté : les classes retirées (ex. « dx ») ne sont plus tirées. Les jours déjà publiés gardent leur mot (historique relu dans les fichiers),
     # un jour épinglé (--pinned) aussi : seul le tirage des jours encore à faire change.
-    draw_candidates = candidates
-    if args.difficulty:
-        draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
-        if not draw_candidates:
-            sys.exit("--drop-classes retire tous les candidats")
+    base_candidates, filtered_candidates, exclusions_start = draw_pools(args, candidates)
+    if not filtered_candidates:
+        sys.exit("--drop-classes retire tous les candidats")
     # Mot de départ à 30 °C (jours >= --start-from) : fréquence frWac de data/pos.tsv, exclusions (noms propres, liste noire, filtre)
     start_ranks = start_excluded = None
     if args.start_from is not None:
@@ -148,12 +155,12 @@ def command_daily(args) -> None:
         if number in forced_words:
             # Mot imposé (admin, jour futur) : prime sur l'épingle et sur le tirage ; l'historique des jours suivants en tient compte
             word = forced_words[number]
-            check_forced_word(number, word, history, lemma_set, draw_candidates)
+            check_forced_word(number, word, history, lemma_set, filtered_candidates if number >= exclusions_start else base_candidates)
         elif pinned_file is not None and pinned_file.exists():
             # Jour régénéré sur un nouveau vocabulaire : on garde EXACTEMENT le mot déjà publié (l'index reste valable : vocabulaire append-only)
             word = lemmas[daily_module.decode_target_index(json.loads(pinned_file.read_text()))]
         else:
-            word = daily_module.next_word(master_key, history, draw_candidates)
+            word = daily_module.next_word(master_key, history, filtered_candidates if number >= exclusions_start else base_candidates)
         history.append(word)
         day = (last_day - datetime.timedelta(days=args.number - number)).isoformat()
         word_index = lemmas.index(word)
@@ -182,8 +189,7 @@ def command_plan(args) -> None:
     data = pathlib.Path(args.data)
     lemmas = next(data.glob("lemmas.*.txt")).read_text(encoding="utf-8").splitlines()
     candidates = read_lines(args.candidates)
-    if args.difficulty:
-        candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    base_candidates, filtered_candidates, exclusions_start = draw_pools(args, candidates)
     history: list[str] = []
     number = 1
     while (data / "daily" / f"{number}.json").exists():
@@ -192,7 +198,7 @@ def command_plan(args) -> None:
     first = number
     rows = []
     for _ in range(args.days):
-        word = daily_module.next_word(master_key, history, candidates)
+        word = daily_module.next_word(master_key, history, filtered_candidates if number >= exclusions_start else base_candidates)
         history.append(word)
         rows.append(f"{number}\t{word}")
         number += 1
@@ -213,9 +219,8 @@ def command_change(args) -> None:
     data = pathlib.Path(args.data)
     lemmas = next(data.glob("lemmas.*.txt")).read_text(encoding="utf-8").splitlines()
     candidates = read_lines(args.candidates)
-    draw_candidates = candidates
-    if args.difficulty:
-        draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    base_candidates, filtered_candidates, exclusions_start = draw_pools(args, candidates)
+    draw_candidates = filtered_candidates if args.number >= exclusions_start else base_candidates
     try:
         request = json.loads(pathlib.Path(args.request).read_text(encoding="utf-8"))
         if not isinstance(request, dict):
@@ -237,15 +242,13 @@ def command_pool(args) -> None:
     data = pathlib.Path(args.data)
     lemmas = next(data.glob("lemmas.*.txt")).read_text(encoding="utf-8").splitlines()
     candidates = read_lines(args.candidates)
-    draw_candidates = candidates
-    if args.difficulty:
-        draw_candidates = difficulty_module.keep_candidates(candidates, difficulty_module.parse_difficulty(pathlib.Path(args.difficulty).read_text(encoding="utf-8")), args.drop_classes)
+    base_candidates, draw_candidates, exclusions_start = draw_pools(args, candidates)
     days = change_module.history_words(data / "daily", lemmas, args.last + 1)
     if days is None:
         sys.exit("jour manquant : export du pool impossible")
-    pool = {"v": 1, "at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "candidates": list(dict.fromkeys(draw_candidates)), "days": days}
+    pool = {"v": 1, "at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "candidates": list(dict.fromkeys(draw_candidates)), "removed": [word for word in dict.fromkeys(base_candidates) if word not in set(draw_candidates)], "days": days}
     pathlib.Path(args.out).write_text(json.dumps(pool, ensure_ascii=False), encoding="utf-8")
-    print(f"pool : {len(pool['candidates'])} candidats, {len(days)} jours")  # des nombres seulement
+    print(f"pool : {len(pool['candidates'])} candidats, {len(pool['removed'])} retirés, {len(days)} jours")  # des nombres seulement
 
 
 def main() -> None:
