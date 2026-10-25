@@ -436,6 +436,12 @@ def report_failure() -> None:
         pass
 
 
+
+def vocab_extends(old_lines: list[str], new_lines: list[str]) -> bool:
+    """Vrai si new_lines prolonge old_lines : mêmes index, un lemme peut être neutralisé (~) mais jamais déplacé ni remplacé."""
+    return len(new_lines) >= len(old_lines) and all(new == old or new == "~" + old or old == "~" + new for old, new in zip(old_lines, new_lines))
+
+
 def main() -> None:
     dry_run = os.environ.get("STOCK_DRY_RUN") == "1"
     days_ahead = int(os.environ.get("STOCK_DAYS_AHEAD", "90"))
@@ -496,8 +502,16 @@ def main() -> None:
     if site_get(f"daily/{today_number}.json", daily_dir / f"{today_number}.json") != "present":
         raise Stop("jour courant introuvable ou illisible en ligne : impossible de vérifier le vocabulaire courant")
     # Le vocabulaire des données doit être le vocabulaire COURANT (celui du jour en ligne), pas seulement un ancien fichier encore hébergé
-    if json.loads((daily_dir / f"{today_number}.json").read_text()).get("vocab") != vocab_hash:
-        raise Stop("le vocabulaire des données n'est pas le vocabulaire courant : republier les données (scripts/local-deploy.sh --publish-data)")
+    current_vocab = json.loads((daily_dir / f"{today_number}.json").read_text()).get("vocab")
+    if current_vocab != vocab_hash:
+        # Après un changement de vocabulaire, les jours J..J+2 restent gelés à l'ancien (freeze_days.py) : le jour courant a l'ancien hash tant que le nouveau n'est pas son tour.
+        # Les données sont acceptées si leur vocabulaire PROLONGE exactement celui du jour courant (append-only, mêmes règles que check_vocab_append_only.py).
+        current_file = work / "vocab-current"
+        if not current_vocab or site_get(f"lemmas.{current_vocab}.txt", current_file) != "present" or not vocab_extends(
+            current_file.read_text(encoding="utf-8").splitlines(), (data / f"lemmas.{vocab_hash}.txt").read_text(encoding="utf-8").splitlines()
+        ):
+            raise Stop("le vocabulaire des données n'est pas le vocabulaire courant : republier les données (scripts/local-deploy.sh --publish-data)")
+        log("Vocabulaire des données = prolongement du vocabulaire du jour courant (gel en cours)")
     manifest_path = work / "manifest.json"
     stock_first, stock_last = today_number, today_number - 1
     if storage.get(STOCK_PREFIX + "manifest.json", manifest_path):
