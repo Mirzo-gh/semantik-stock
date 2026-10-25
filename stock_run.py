@@ -544,7 +544,7 @@ def main() -> None:
             pinned_day = json.loads(destination.read_text())
         except ValueError:
             raise Stop(f"jour n°{number} illisible (JSON invalide) : arrêt") from None
-        if pinned_day.get("n") != number or pinned_day.get("vocab") != vocab_hash:
+        if pinned_day.get("n") != number or pinned_day.get("vocab") not in (vocab_hash, current_vocab):  # J..J+2 peuvent rester gelés à l'ancien vocabulaire
             raise Stop(f"jour n°{number} : numéro ou vocabulaire inattendu : arrêt")
     # Garde-fou : un jour J..J+2 déjà dans le stock doit être le MÊME que la prod (mêmes mots, même ordre, scores à ±1 près : Mac/Linux). Sinon le stock est sur une autre chaîne de mots
     # (le tirage dépend de l'historique) : arrêt, rien n'est généré ni déposé ; refaire le stock à partir des jours publiés.
