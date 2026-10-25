@@ -87,6 +87,8 @@ def parse_difficulty(text: str) -> dict[str, tuple[int, str]]:
 DRAW_EXCLUSIONS_NAME = "draw_exclusions.txt"
 DRAW_KEEP_NAME = "candidates_keep.txt"
 DRAW_FROM_NAME = "draw_exclusions_from.txt"
+DRAW_ADDITIONS_NAME = "draw_additions.txt"
+DRAW_ADDITIONS_FROM_NAME = "draw_additions_from.txt"
 
 
 def _read_word_file(path: pathlib.Path) -> frozenset[str]:
@@ -106,6 +108,15 @@ def read_draw_exclusions_from(difficulty_path) -> int:
     """Premier jour (numéro) où les exclusions du tirage s'appliquent (`draw_exclusions_from.txt`) ; absent : dès le jour 1."""
     path = pathlib.Path(difficulty_path).with_name(DRAW_FROM_NAME)
     return int(path.read_text(encoding="utf-8").split()[0]) if path.exists() else 1
+
+
+def read_draw_additions(difficulty_path) -> tuple[frozenset[str], int]:
+    """Candidats AJOUTÉS au tirage (décision humaine du 25/10) : `draw_additions.txt` (un mot par ligne) et `draw_additions_from.txt` (premier jour qui peut les tirer),
+    à côté de difficulty.tsv. Les mots figurent aussi dans candidates.tsv / difficulty.tsv ; avant ce jour ils sont retirés du tirage, pour que les jours déjà fabriqués ne bougent pas."""
+    folder = pathlib.Path(difficulty_path).parent
+    words = _read_word_file(folder / DRAW_ADDITIONS_NAME)
+    path = folder / DRAW_ADDITIONS_FROM_NAME
+    return words, (int(path.read_text(encoding="utf-8").split()[0]) if words and path.exists() else 1)
 
 
 def keep_candidates(candidates: list[str], table: dict[str, tuple[int, str]], dropped_classes: str, excluded: frozenset[str] = frozenset()) -> list[str]:

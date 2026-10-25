@@ -1,6 +1,7 @@
 """Vocabulaire (lemmas.<hash>.txt) et table de formes (forms.<hash>.txt), DATA_CONTRACT §2-3."""
 import csv
 import hashlib
+import re
 import unicodedata
 
 PLAYABLE_CATEGORIES = {"NOM", "VER", "ADJ", "ADV"}
@@ -59,10 +60,25 @@ def render_forms(pairs: list[tuple[str, str]], lemmas: list[str]) -> str:
 TOMBSTONE = "~"  # prefixe d'un lemme neutralise : l'index reste (anciens daily), mais plus aucune saisie ne peut le trouver
 
 
+SEPARATORS = re.compile(r"[\s\-\u2010-\u2015\u2212_]")  # espace, tiret, traits d'union et tirets typographiques (DATA_CONTRACT §6.1)
+
+
 def fold(word: str) -> str:
-    """Même repli que le client (DATA_CONTRACT §6) : NFC, minuscule, œ/æ, sans diacritiques."""
-    word = unicodedata.normalize("NFC", word.strip().lower()).replace("œ", "oe").replace("æ", "ae")
-    return "".join(char for char in unicodedata.normalize("NFD", word) if not unicodedata.category(char).startswith("M"))
+    """Même clé que le client (DATA_CONTRACT §6.1) : NFC, minuscule, œ/æ, sans diacritiques, puis sans tiret ni espace (l'apostrophe reste)."""
+    word = unicodedata.normalize("NFC", word.strip().lower()).replace("œ", "oe").replace("æ", "ae").replace("’", "'")
+    folded = "".join(char for char in unicodedata.normalize("NFD", word) if not unicodedata.category(char).startswith("M"))
+    return SEPARATORS.sub("", folded)
+
+
+def separator_collisions(entries: list[str]) -> dict[str, list[str]]:
+    """Clés partagées par deux entrées distinctes dont l'une porte un tiret ou une espace (« week-end » / « weekend »).
+
+    Les doublons d'accent (« ete » / « été ») ne sont pas ici : find_junk les traite. Le build s'arrête si ce dictionnaire n'est pas vide.
+    """
+    groups: dict[str, set[str]] = {}
+    for entry in entries:
+        groups.setdefault(fold(entry), set()).add(entry)
+    return {key: sorted(group) for key, group in groups.items() if len(group) > 1 and any(SEPARATORS.search(entry) for entry in group)}
 
 
 def find_junk(rows: list[tuple], form_folds: set[str], protected: set[str]) -> set[str]:

@@ -25,9 +25,9 @@ def synthetic_lemmas(count: int) -> list[str]:
 
 
 def fold(word: str) -> str:
-    """Minuscule sans accent (comparaison de familles de mots)."""
+    """Minuscule sans accent ni tiret/espace (comparaison de familles de mots ; même clé que vocab.fold)."""
     decomposed = unicodedata.normalize("NFD", word.lower().replace("œ", "oe").replace("æ", "ae"))
-    return "".join(character for character in decomposed if not unicodedata.combining(character))
+    return "".join(character for character in decomposed if not unicodedata.combining(character) and character not in "- \u2010\u2011\u2012\u2013\u2014\u2015\u2212_")
 
 
 def edit_distance(left: str, right: str, limit: int) -> int:

@@ -2,6 +2,7 @@
 
 Les formes fléchies viennent du vocabulaire du modèle non lemmatisé, ramenées au lemme par simplemma (MIT).
 """
+import itertools
 import re
 
 import numpy as np
@@ -133,3 +134,29 @@ def select_forms(path: str, lemmas: set[str], limit_rank: int = 400_000, pos_of:
                 pairs.setdefault(form, ruled)
                 by_rule[form] = ruled
     return sorted(pairs.items()), sorted(by_rule.items())
+
+
+def compound_forms(path: str, lemmas, limit_rank: int = 400_000) -> list[tuple[str, str]]:
+    """Pluriels des composés à tiret (« grands-mères », « chauves-souris ») : couples (forme, lemme).
+
+    Le lemmatiseur et WORD_PATTERN ignorent les tirets ; pour chaque lemme à tiret on génère les variantes où un sous-ensemble de morceaux
+    prend un « s », et on ne garde que celles attestées dans le modèle non lemmatisé (rang < limit_rank). Un lemme n'a jamais d'apostrophe.
+    """
+    wanted: dict[str, str] = {}
+    for lemma in lemmas:
+        parts = lemma.split("-")
+        if len(parts) < 2 or "'" in lemma:
+            continue
+        pluralisable = [index for index, part in enumerate(parts) if not part.endswith(("s", "x", "z"))]
+        for size in range(1, len(pluralisable) + 1):
+            for chosen in itertools.combinations(pluralisable, size):
+                variant = "-".join(part + "s" if index in chosen else part for index, part in enumerate(parts))
+                wanted.setdefault(variant, lemma)
+    found: dict[str, str] = {}
+    for rank, form, _ in read_tokens(path, keep_vectors=False):
+        if rank >= limit_rank:
+            break
+        form = normalize(form)
+        if form in wanted and form not in lemmas:
+            found[form] = wanted[form]
+    return sorted(found.items())
