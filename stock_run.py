@@ -397,11 +397,22 @@ def prepare_rebuild(first_number: int, storage: "Storage", work: pathlib.Path, d
     return first_number - 1
 
 
+def target_index(path: pathlib.Path):
+    """Index du mot du jour d'un fichier daily (jamais affiché), None si illisible : on compare les MOTS, pas les scores (écarts Mac/Linux de ±1 ou plus sur quelques scores)."""
+    try:
+        sys.path.insert(0, str(HERE / "pipeline"))
+        from semantik_pipeline import daily as daily_module
+        return daily_module.decode_target_index(json.loads(path.read_text()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def report_rebuild(daily_dir: pathlib.Path, last: int) -> None:
     """Nombres seulement : combien de jours reconstruits ont changé de mot par rapport au stock d'avant."""
     kept, first = REBUILD_CONTEXT["before"], REBUILD_CONTEXT["first"]
     compared = [number for number in range(first, last + 1) if (kept / f"{number}.json").exists() and (daily_dir / f"{number}.json").exists()]
-    changed = [number for number in compared if not same_published_day(kept / f"{number}.json", daily_dir / f"{number}.json")]
+    before_after = {number: (target_index(kept / f"{number}.json"), target_index(daily_dir / f"{number}.json")) for number in compared}
+    changed = [number for number, (before, after) in before_after.items() if before is None or after is None or before != after]  # illisible = compté comme changé
     log(f"Reconstruction : {len(changed)} jours sur {len(compared)} ont changé de mot (n°{first} à n°{last}).")
 
 
@@ -533,7 +544,7 @@ def main() -> None:
     candidates.write_text("\n".join(line.split("\t")[1] for line in (files / "candidates.tsv").read_text(encoding="utf-8").splitlines()[1:]) + "\n", encoding="utf-8")
     (work / "pinned").mkdir()
     environment = dict(os.environ, SEMANTIK_MASTER_KEY=master_key, PYTHONPATH=str(HERE / "pipeline"))
-    if dry_run and not os.environ.get("STOCK_REBUILD_FROM") and (files / "start_from.txt").exists():  # une reconstruction change la chaîne par construction : pas de comparaison
+    if dry_run and (files / "start_from.txt").exists() and not os.environ.get("STOCK_REBUILD_FROM"):  # pendant une reconstruction tout change par construction
         # Mot de départ : AVANT toute suppression dans R2, on regénère à blanc les jours du stock concernés et on les compare à l'existant
         check_start_regeneration(work, data, daily_dir, files, models, candidates, environment, launch, today_number, stock_first, stock_last)
     change_number = os.environ.get("STOCK_CHANGE_NUMBER", "").strip()
